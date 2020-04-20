@@ -6,14 +6,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/apis/fedlearner.k8s.io/v1alpha1"
+	trainutil "github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/util/train"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/klog"
-
-	"github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/apis/fedlearner.k8s.io/v1alpha1"
 )
 
 const (
@@ -82,8 +82,22 @@ func (am *appManager) reconcilePodsWithType(
 					am.recorder.Eventf(app, v1.EventTypeNormal, exitedWithCodeReason, "Pod: %v.%v exited with code %v", pod.Namespace, pod.Name, exitCode)
 				}
 			}
-			restartPod := spec.RestartPolicy == v1alpha1.RestartPolicyAlways ||
-				(spec.RestartPolicy == v1alpha1.RestartPolicyOnFailure && pod.Status.Phase == v1.PodFailed && exitCode != 0)
+			var restartPod bool
+			switch spec.RestartPolicy {
+			case v1alpha1.RestartPolicyAlways:
+				restartPod = true
+
+			case v1alpha1.RestartPolicyOnFailure:
+				if pod.Status.Phase == v1.PodFailed && exitCode != 0 {
+					restartPod = true
+				}
+
+			case v1alpha1.RestartPolicyExitCode:
+				if pod.Status.Phase == v1.PodFailed && trainutil.IsRetryableExitCode(exitCode) {
+					restartPod = true
+				}
+			}
+
 			if restartPod {
 				klog.Infof("Need to restart the pod: %v.%v", pod.Namespace, pod.Name)
 				if err = am.podControl.DeletePod(ctx, pod.Namespace, pod.Name, app); err != nil {
@@ -225,7 +239,7 @@ func (am *appManager) createNewPod(
 					Value: GenIndexName(app.Name, strings.ToLower(app.Spec.Role), rt, index),
 				})
 
-			case v1alpha1.FLReplicateTypeWorker:
+			case v1alpha1.FLReplicaTypeWorker:
 				container.Env = ensureEnv(container.Env, v1.EnvVar{
 					Name:  workerService,
 					Value: GenIndexName(app.Name, strings.ToLower(app.Spec.Role), rt, index),
