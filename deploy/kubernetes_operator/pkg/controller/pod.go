@@ -6,14 +6,15 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/apis/fedlearner.k8s.io/v1alpha1"
-	trainutil "github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/util/train"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/klog"
+
+	"github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/apis/fedlearner.k8s.io/v1alpha1"
+	trainutil "github.com/bytedance/fedlearner/deploy/kubernetes_operator/pkg/util/train"
 )
 
 const (
@@ -36,10 +37,15 @@ func (am *appManager) reconcilePods(ctx context.Context, app *v1alpha1.FLApp) er
 	}
 
 	for rtype, spec := range app.Spec.FLReplicaSpecs {
-		err = am.reconcilePodsWithType(ctx, app, pods, rtype, spec)
+		terminated, err := am.reconcilePodsWithType(ctx, app, pods, rtype, spec)
 		if err != nil {
 			klog.Errorf("reconcilePods error: %v", err)
 			return err
+		}
+
+		if terminated {
+			am.appStatusUpdater.UpdateAppStateWithRetry(ctx, app, v1alpha1.FLStateFailing)
+			break
 		}
 	}
 	return nil
@@ -51,11 +57,11 @@ func (am *appManager) reconcilePodsWithType(
 	pods []*v1.Pod,
 	rtype v1alpha1.FLReplicaType,
 	spec v1alpha1.ReplicaSpec,
-) error {
+) (terminated bool, err error) {
 	rt := strings.ToLower(string(rtype))
-	pods, err := FilterPodsForReplicaType(pods, rt)
+	pods, err = FilterPodsForReplicaType(pods, rt)
 	if err != nil {
-		return err
+		return false, err
 	}
 	replicas := int(*spec.Replicas)
 	podSlices := am.makePodSlicesByIndex(pods, replicas)
@@ -66,7 +72,7 @@ func (am *appManager) reconcilePodsWithType(
 			// Need to create a new pod
 			klog.Infof("need to create new pod for %s %d", rtype, index)
 			if err = am.createNewPod(ctx, app, rtype, spec, strconv.Itoa(index)); err != nil {
-				return err
+				return false, err
 			}
 		case 1:
 			// Check the status of current pod
@@ -88,33 +94,49 @@ func (am *appManager) reconcilePodsWithType(
 				restartPod = true
 
 			case v1alpha1.RestartPolicyOnFailure:
-				if pod.Status.Phase == v1.PodFailed && exitCode != 0 {
-					restartPod = true
+				if pod.Status.Phase != v1.PodFailed {
+					break
 				}
+
+				if exitCode == 0 {
+					break
+				}
+
+				restartPod = true
 
 			case v1alpha1.RestartPolicyExitCode:
-				if pod.Status.Phase == v1.PodFailed && trainutil.IsRetryableExitCode(exitCode) {
-					restartPod = true
+				if pod.Status.Phase != v1.PodFailed {
+					break
 				}
+
+				// terminate the fedlearner app if the exit code is not retryable.
+				if !trainutil.IsRetryableExitCode(exitCode) {
+					return true, nil
+				}
+
+				restartPod = true
 			}
 
-			if restartPod {
-				klog.Infof("Need to restart the pod: %v.%v", pod.Namespace, pod.Name)
-				if err = am.podControl.DeletePod(ctx, pod.Namespace, pod.Name, app); err != nil {
-					return err
-				}
+			if !restartPod {
+				break
 			}
+
+			klog.Infof("Need to restart the pod: %v.%v", pod.Namespace, pod.Name)
+			if err = am.podControl.DeletePod(ctx, pod.Namespace, pod.Name, app); err != nil {
+				return false, err
+			}
+
 		default:
 			// Kill unnecessary pods.
 			for i := 1; i < podCount; i++ {
 				pod := podSlice[i]
 				if err = am.podControl.DeletePod(ctx, pod.Namespace, pod.Name, app); err != nil {
-					return err
+					return false, err
 				}
 			}
 		}
 	}
-	return nil
+	return false, nil
 }
 
 func (am *appManager) getPodsForApp(ctx context.Context, app *v1alpha1.FLApp) ([]*v1.Pod, error) {
